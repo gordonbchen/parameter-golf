@@ -70,6 +70,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    low_rank = int(os.environ.get("LOW_RANK", 32))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -512,6 +513,19 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+    
+
+class LoRA(nn.Module):
+    def __init__(self, linear: nn.Linear, low_rank: int):
+        super().__init__()
+        self.linear = linear
+        dout, din = linear.weight.shape
+        self.A = CastedLinear(din, low_rank, bias=False)
+        self.B = CastedLinear(low_rank, dout, bias=False)
+        self.B._zero_init = True
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear(x) + self.B(self.A(x))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -556,30 +570,23 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
-        dim: int,
+        qkvproj: list[CastedLinear],
+        rotary: Rotary,
+        head_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_base: float,
         qk_gain_init: float,
+        low_rank: int,
     ):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.c_q, self.c_k, self.c_v, self.proj = [LoRA(l, low_rank) for l in qkvproj]
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = rotary
+
+        self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.enable_gqa = num_heads != num_kv_heads
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -592,14 +599,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=self.enable_gqa)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -622,16 +622,19 @@ class Block(nn.Module):
     def __init__(
         self,
         dim: int,
+        qkvproj: list[CastedLinear],
+        rotary: Rotary,
+        head_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        rope_base: float,
         qk_gain_init: float,
+        low_rank: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(qkvproj, rotary, head_dim, num_heads, num_kv_heads, qk_gain_init, low_rank)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -660,6 +663,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        low_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -672,19 +676,30 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        # Shared block linears and rotary.
+        if model_dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        head_dim = model_dim // num_heads
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = num_kv_heads * head_dim
+
+        self.c_q = CastedLinear(model_dim, model_dim, bias=False)
+        self.c_k = CastedLinear(model_dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(model_dim, kv_dim, bias=False)
+        self.proj = CastedLinear(model_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        qkvproj = [self.c_q, self.c_k, self.c_v, self.proj]
+
+        self.rotary = Rotary(head_dim, base=rope_base)
+
+        self.blocks = nn.ModuleList([
+            Block(model_dim, qkvproj, self.rotary, head_dim, num_heads, num_kv_heads, mlp_mult, qk_gain_init, low_rank)
+            for i in range(num_layers)
+        ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -836,6 +851,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        low_rank=args.low_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
