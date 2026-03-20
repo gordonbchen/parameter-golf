@@ -73,6 +73,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    attn_lora_rank = int(os.environ.get("ATTN_LORA_RANK", 32))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -80,6 +81,7 @@ class Hyperparameters:
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
+    shared_attn_lr = float(os.environ.get("SHARED_ATTN_LR", -1.0))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
@@ -532,6 +534,19 @@ class CastedLinear(nn.Linear):
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
+    
+
+class LoRA(nn.Module):
+    def __init__(self, linear: nn.Linear, lora_rank: int):
+        super().__init__()
+        self.linear = linear
+        dout, din = linear.weight.shape
+        self.A = CastedLinear(din, lora_rank, bias=False)
+        self.B = CastedLinear(lora_rank, dout, bias=False)
+        self.B._zero_init = True
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.linear(x) + self.B(self.A(x))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -586,30 +601,23 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
-        dim: int,
+        qkvproj: list[CastedLinear],
+        rotary: Rotary,
+        head_dim: int,
         num_heads: int,
         num_kv_heads: int,
-        rope_base: float,
         qk_gain_init: float,
+        attn_lora_rank: int,
     ):
         super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError("model_dim must be divisible by num_heads")
-        if num_heads % num_kv_heads != 0:
-            raise ValueError("num_heads must be divisible by num_kv_heads")
+        self.c_q, self.c_k, self.c_v, self.proj = [LoRA(l, attn_lora_rank) for l in qkvproj]
+        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        self.rotary = rotary
+
+        self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
-        if self.head_dim % 2 != 0:
-            raise ValueError("head_dim must be even for RoPE")
-        kv_dim = self.num_kv_heads * self.head_dim
-        self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024)
+        self.enable_gqa = num_heads != num_kv_heads
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -622,14 +630,7 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True, enable_gqa=self.enable_gqa)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -651,17 +652,20 @@ class Block(nn.Module):
     def __init__(
         self,
         dim: int,
+        qkvproj: list[CastedLinear],
+        rotary: Rotary,
+        head_dim: int,
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        rope_base: float,
         qk_gain_init: float,
+        attn_lora_rank: int,
         mlp_hidden: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(qkvproj, rotary, head_dim, num_heads, num_kv_heads, qk_gain_init, attn_lora_rank)
         self.mlp = MLP(dim, mlp_mult, mlp_hidden)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -691,6 +695,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attn_lora_rank: int,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -703,20 +708,30 @@ class GPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                    mlp_hidden=mlp_hidden,
-                )
-                for i in range(num_layers)
-            ]
-        )
+
+        # Shared attn linears and rotary.
+        if model_dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
+        if num_heads % num_kv_heads != 0:
+            raise ValueError("num_heads must be divisible by num_kv_heads")
+        head_dim = model_dim // num_heads
+        if head_dim % 2 != 0:
+            raise ValueError("head_dim must be even for RoPE")
+        kv_dim = num_kv_heads * head_dim
+
+        self.c_q = CastedLinear(model_dim, model_dim, bias=False)
+        self.c_k = CastedLinear(model_dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(model_dim, kv_dim, bias=False)
+        self.proj = CastedLinear(model_dim, model_dim, bias=False)
+        self.proj._zero_init = True
+        qkvproj = [self.c_q, self.c_k, self.c_v, self.proj]
+
+        self.rotary = Rotary(head_dim, base=rope_base)
+
+        self.blocks = nn.ModuleList([
+            Block(model_dim, qkvproj, self.rotary, head_dim, num_heads, num_kv_heads, mlp_mult, qk_gain_init, attn_lora_rank, mlp_hidden)
+            for i in range(num_layers)
+        ])
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -938,6 +953,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attn_lora_rank=args.attn_lora_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -949,13 +965,18 @@ def main() -> None:
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
     # - untied lm_head (Adam) uses HEAD_LR
+    # - shared attention matrices use SHARED_ATTN_LR via Muon
     # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
+    shared_attn_params = [base_model.c_q.weight, base_model.c_k.weight, base_model.c_v.weight, base_model.proj.weight]
+    shared_attn_matrix_suffixes = (".attn.c_q.linear.weight", ".attn.c_k.linear.weight", ".attn.c_v.linear.weight", ".attn.proj.linear.weight")
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and not name.endswith(shared_attn_matrix_suffixes)
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
@@ -971,14 +992,30 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
+    shared_attn_lr = args.shared_attn_lr if args.shared_attn_lr > 0.0 else args.matrix_lr
     optimizer_muon = Muon(
-        matrix_params,
+        [
+            {
+                "params": matrix_params,
+                "lr": args.matrix_lr,
+                "base_lr": args.matrix_lr,
+                "momentum": args.muon_momentum,
+                "backend_steps": args.muon_backend_steps,
+                "nesterov": True,
+            },
+            {
+                "params": shared_attn_params,
+                "lr": shared_attn_lr,
+                "base_lr": shared_attn_lr,
+                "momentum": args.muon_momentum,
+                "backend_steps": args.muon_backend_steps,
+                "nesterov": True,
+            },
+        ],
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
     )
-    for group in optimizer_muon.param_groups:
-        group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
@@ -1003,7 +1040,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"shared_attn_lr:{shared_attn_lr} matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
